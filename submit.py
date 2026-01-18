@@ -1,0 +1,167 @@
+# --- FILE: make_submission_256.py ---
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import os
+from torch.utils.data import Dataset, DataLoader
+
+# --- CONFIGURARE ---
+TEST_CSV = 'test.csv'
+IMG_FOLDER = 'samples'
+MODEL_PATH = 'siamese_cnn_256.pth'  # <--- Modelul nou pe care îl antrenezi acum
+OUTPUT_FILE = 'submission256.csv'
+BATCH_SIZE = 16  # Redus pt 256px
+
+# Detectare Hardware
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    print("--- Engine: M4 GPU (MPS) ---")
+else:
+    DEVICE = torch.device("cpu")
+    print("--- Engine: CPU ---")
+
+# --- ARHITECTURA (Aceeași V2, ea se adaptează singură la mărime) ---
+class SiameseNetwork(nn.Module):
+    def __init__(self):
+        super(SiameseNetwork, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool2d(2, 2),
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool2d(2, 2),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool2d(2, 2),
+            
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1),
+            nn.MaxPool2d(2, 2),
+        )
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.3),
+            nn.Linear(256, 64)
+        )
+        self.classifier = nn.Sequential(
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward_one(self, x):
+        x = self.cnn(x)
+        x = self.gap(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+    def forward(self, img1, img2):
+        feat1 = self.forward_one(img1)
+        feat2 = self.forward_one(img2)
+        diff = torch.abs(feat1 - feat2)
+        output = self.classifier(diff)
+        return output
+
+# --- DATASET (Setat pe 256px) ---
+class TestDataset(Dataset):
+    def __init__(self, csv_file, img_folder):
+        self.df = pd.read_csv(csv_file)
+        self.img_folder = img_folder
+        self.target_size = 256 # <--- IMPORTANT: 256
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        id1 = row['id_noise_1']
+        id2 = row['id_noise_2']
+        
+        p1 = os.path.join(self.img_folder, f"{id1}.npy" if not str(id1).endswith('.npy') else id1)
+        p2 = os.path.join(self.img_folder, f"{id2}.npy" if not str(id2).endswith('.npy') else id2)
+
+        try:
+            img1 = np.load(p1).astype(np.float32) / 255.0
+            img2 = np.load(p2).astype(np.float32) / 255.0
+        except:
+            img1 = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+            img2 = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+
+        # Center Crop la 256
+        H, W = img1.shape
+        target = self.target_size
+        if H > target and W > target:
+            top = (H - target) // 2
+            left = (W - target) // 2
+            img1 = img1[top:top+target, left:left+target]
+            img2 = img2[top:top+target, left:left+target]
+        
+        t1 = torch.from_numpy(img1).unsqueeze(0)
+        t2 = torch.from_numpy(img2).unsqueeze(0)
+        return t1, t2
+
+def make_submission():
+    print(f"1. Încărcăm modelul: {MODEL_PATH}")
+    model = SiameseNetwork().to(DEVICE)
+    try:
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        print("   Model 256px încărcat cu succes!")
+    except FileNotFoundError:
+        print(f"EROARE: Nu găsesc '{MODEL_PATH}'!")
+        return
+    
+    model.eval()
+
+    test_ds = TestDataset(TEST_CSV, IMG_FOLDER)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    
+    final_predictions = []
+    print(f"2. Generăm predicții TTA (256px) pentru {len(test_ds)} perechi...")
+
+    with torch.no_grad():
+        for i, (img1, img2) in enumerate(test_loader):
+            img1 = img1.to(DEVICE)
+            img2 = img2.to(DEVICE)
+            
+            # --- TTA LOGIC (Original + Flip H + Flip V) ---
+            p1 = model(img1, img2)
+            p2 = model(torch.flip(img1, [3]), torch.flip(img2, [3])) # H Flip
+            p3 = model(torch.flip(img1, [2]), torch.flip(img2, [2])) # V Flip
+            
+            avg_prob = (p1 + p2 + p3) / 3.0
+            
+            preds = (avg_prob > 0.5).float().cpu().numpy().flatten()
+            final_predictions.extend(preds)
+            
+            if (i+1) % 50 == 0:
+                print(f"   Batch {i+1} complet...")
+
+    # --- 3. FORMATOREA (uuid,uuid) ---
+    print("\n3. Formatăm CSV-ul...")
+    df = pd.read_csv(TEST_CSV)
+    df['id_pair'] = "(" + df['id_noise_1'].astype(str) + "," + df['id_noise_2'].astype(str) + ")"
+    df['label'] = np.array(final_predictions).astype(int)
+    
+    submission_df = df[['id_pair', 'label']]
+    submission_df.to_csv(OUTPUT_FILE, index=False)
+    
+    print(f"SUCCESS! Fișier generat: {OUTPUT_FILE}")
+    print(submission_df.head(3))
+
+if __name__ == "__main__":
+    make_submission()
